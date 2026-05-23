@@ -3,7 +3,6 @@ import json
 import logging
 import tempfile
 from datetime import datetime, time, timedelta
-
 import pytz
 from anthropic import Anthropic
 from openai import OpenAI
@@ -14,7 +13,7 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# ── CONFIG ─────────────────────────────────────────────────────────────────────────
+# ── CONFIG ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 OPENAI_KEY    = os.environ["OPENAI_API_KEY"]
@@ -29,7 +28,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── CONSTANTS ──────────────────────────────────────────────────────────────────────
+# ── CONSTANTS ──────────────────────────────────────────────────────────────────
 CAT_LABEL = {
     "cozy":     "🏠 Cozy Home",
     "content":  "🎬 Контент и съёмки",
@@ -50,7 +49,7 @@ def now_uae():
 def today_str():
     return now_uae().date().isoformat()
 
-# ── DATABASE: TASKS ─────────────────────────────────────────────────────────────────────
+# ── DATABASE: TASKS ────────────────────────────────────────────────────────────
 def db_get_open(user_id):
     return supabase.table("tasks").select("*")\
         .eq("user_id", user_id).in_("status", ["open", "waiting"])\
@@ -108,7 +107,7 @@ def nextdeadline(recurrence: str) -> str:
         return (today + timedelta(days=diff)).isoformat()
     return (today + timedelta(days=7)).isoformat()
 
-# ── DATABASE: PROJECTS ──────────────────────────────────────────────────────────────────
+# ── DATABASE: PROJECTS ─────────────────────────────────────────────────────────
 def db_create_project(user_id, title, category, deadline=None):
     res = supabase.table("projects").insert({
         "user_id": user_id, "title": title,
@@ -144,7 +143,7 @@ def db_find_project(user_id, name_part):
             return p
     return None
 
-# ── DATABASE: NOTES ─────────────────────────────────────────────────────────────────────
+# ── DATABASE: NOTES ────────────────────────────────────────────────────────────
 def db_add_note(user_id, content, category="other"):
     res = supabase.table("notes").insert({
         "user_id": user_id, "content": content, "category": category
@@ -159,7 +158,7 @@ def db_get_notes(user_id, search=None):
         return [n for n in res.data if search in n["content"].lower()]
     return res.data
 
-# ── DATABASE: HABITS ────────────────────────────────────────────────────────────────────
+# ── DATABASE: HABITS ───────────────────────────────────────────────────────────
 def db_get_habits(user_id):
     return supabase.table("habits").select("*").eq("user_id", user_id).execute().data
 
@@ -188,7 +187,7 @@ def db_get_habit_logs_week(user_id):
     return supabase.table("habit_logs").select("*")\
         .eq("user_id", user_id).gte("date", week_ago).execute().data
 
-# ── DATABASE: DAY RATING ────────────────────────────────────────────────────────────
+# ── DATABASE: DAY RATING ───────────────────────────────────────────────────────
 def db_save_rating(user_id, rating, note=None):
     try:
         supabase.table("day_ratings").upsert({
@@ -198,7 +197,7 @@ def db_save_rating(user_id, rating, note=None):
     except:
         pass
 
-# ── AI: PARSE ────────────────────────────────────────────────────────────────────────────
+# ── AI: PARSE ──────────────────────────────────────────────────────────────────
 SYSTEM_PARSE = """Ты — AI-планировщик предпринимателя Елены (Al Ain, UAE).
 
 Категории:
@@ -206,20 +205,29 @@ SYSTEM_PARSE = """Ты — AI-планировщик предпринимате�
   content   — Контент и съёмки: клипы, монтаж, съёмки для брендов, UGC, AI-генерация
   marketing — Маркетинг и реклама: реклама, SMM, посты, блог, Instagram, продвижение
   finance   — Финансы: оплаты, счета, бюджет
-  life      — Личное: быт, покупки, семья, путешествия, билеты
+  life      — Личное: быт, покупки, семья, путешествия, билеты, личные дела
   fit       — Фитнес и здоровье: тренировки, питание, врачи
   edu       — Обучение: английский, курсы, навыки
   other     — всё остальное
 
-Приоритеты:
-  срочно  — дедлайн сегодня/завтра
-  важно   — эта неделя
-  обычное — без срока
+Приоритеты — строго по дедлайну:
+  срочно  — дедлайн СЕГОДНЯ (только сегодня, не завтра)
+  важно   — дедлайн завтра или в течение недели
+  обычное — нет дедлайна, или личные дела без срока (маникюр, покупки и т.д.)
 
-Из потока сознания определи тип каждого элемента и верни ТОЛЬКО JSON:
+Правила разделения типов:
+  ЗАДАЧА (new_tasks) — действие которое нужно выполнить и закрыть
+    Примеры: подготовить КП, позвонить клиенту, вернуть облако в список задач
+    ВАЖНО: вернуть X, добавить X, поставить X в список = ЗАДАЧА, не заметка
+  ЗАМЕТКА (new_notes) — идея, мысль, контакт, референс, НЕ требует действия прямо сейчас
+    Примеры: идея для рилс, контакт Марины, референс для съёмки
+  ПРОЕКТ (new_projects) — несколько этапов с общей целью
+  ПРИВЫЧКА (new_habits) — регулярное действие (каждый день, каждую неделю)
+
+Верни ТОЛЬКО валидный JSON без markdown:
 {
-  "new_tasks": [{"title":"...","category":"...","priority":"...","deadline":"строка или null","notes":"или null","is_recurring":false,"recurrence":"daily|weekly:mon|null"}],
-  "new_projects": [{"title":"...","category":"...","deadline":"или null","stages":["этач1","этач2"]}],
+  "new_tasks": [{"title":"...","category":"...","priority":"срочно|важно|обычное","deadline":"строка или null","notes":"или null","is_recurring":false,"recurrence":"daily|weekly:mon|null"}],
+  "new_projects": [{"title":"...","category":"...","deadline":"или null","stages":["этап1","этап2"]}],
   "new_notes": [{"content":"...","category":"..."}],
   "new_habits": [{"title":"...","frequency":"daily|weekly"}],
   "close_task_ids": [числа],
@@ -233,7 +241,6 @@ def ai_parse(text, existing_tasks, existing_projects, existing_habits):
     tasks_ctx = json.dumps([{"id":t["id"],"title":t["title"]} for t in existing_tasks], ensure_ascii=False)
     proj_ctx  = json.dumps([{"id":p["id"],"title":p["title"]} for p in existing_projects], ensure_ascii=False)
     hab_ctx   = json.dumps([{"id":h["id"],"title":h["title"]} for h in existing_habits], ensure_ascii=False)
-
     r = claude.messages.create(
         model="claude-opus-4-5", max_tokens=1500,
         system=SYSTEM_PARSE + f"\n\nОткрытые задачи: {tasks_ctx}\nПроекты: {proj_ctx}\nПривычки: {hab_ctx}",
@@ -242,7 +249,7 @@ def ai_parse(text, existing_tasks, existing_projects, existing_habits):
     raw = r.content[0].text.replace("```json","").replace("```","").strip()
     return json.loads(raw)
 
-# ── AI: BRIEFING ──────────────────────────────────────────────────────────────────────
+# ── AI: BRIEFING ───────────────────────────────────────────────────────────────
 def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
     urgent = [t for t in open_tasks if t["priority"] == "срочно"]
     proj_summary = []
@@ -250,12 +257,10 @@ def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
         stages = db_get_project_stages(p["id"])
         done = sum(1 for s in stages if s["status"] == "done")
         proj_summary.append(f"{p['title']}: {done}/{len(stages)} этапов")
-
     habits_status = []
     for h in habits:
         done = h["id"] in habit_logs_today
         habits_status.append(f"{'✅' if done else '⬜'} {h['title']}")
-
     prompt = f"""Утро Елены. Напиши:
 1. Персональную мотивационную фразу (1-2 предложения) — основана на её задачах сегодня, живая и конкретная, не банальная
 2. Топ-3 приоритета на день
@@ -265,6 +270,7 @@ def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
 Открытых задач: {len(open_tasks)} | Срочных: {len(urgent)} | Закрыто вчера: {len(closed_today)}
 Активные проекты: {', '.join(proj_summary) if proj_summary else 'нет'}
 Привычки: {', '.join(habits_status) if habits_status else 'не настроены'}
+
 Задачи: {json.dumps([{"title":t["title"],"priority":t["priority"],"deadline":t.get("deadline")} for t in open_tasks[:10]], ensure_ascii=False)}
 
 Формат ответа:
@@ -278,19 +284,20 @@ def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
 ⏭ Можно отложить: ...
 
 Стиль: по-русски, коротко, конкретно."""
-
     r = claude.messages.create(model="claude-opus-4-5", max_tokens=500,
-        messages=[{"role":"user","content":prompt}])
+                               messages=[{"role":"user","content":prompt}])
     return r.content[0].text
 
 def ai_midday(open_tasks, closed_today):
     urgent = [t for t in open_tasks if t["priority"] == "срочно"]
     prompt = f"""Дневное напоминание Елены (13:00). Коротко, по делу.
+
 Открыто: {len(open_tasks)} | Срочных: {len(urgent)} | Закрыто сегодня: {len(closed_today)}
 Срочные: {json.dumps([t["title"] for t in urgent], ensure_ascii=False)}
+
 Напиши: что нужно закрыть до вечера, один конкретный совет. По-русски, 3-4 предложения."""
     r = claude.messages.create(model="claude-opus-4-5", max_tokens=300,
-        messages=[{"role":"user","content":prompt}])
+                               messages=[{"role":"user","content":prompt}])
     return r.content[0].text
 
 def ai_evening(open_tasks, closed_today, habits, habit_logs_today):
@@ -298,7 +305,6 @@ def ai_evening(open_tasks, closed_today, habits, habit_logs_today):
     for h in habits:
         done = h["id"] in habit_logs_today
         habits_status.append(f"{'✅' if done else '❌'} {h['title']}")
-
     prompt = f"""Вечерний итог Елены (21:00).
 Закрыто сегодня: {len(closed_today)} задач: {json.dumps([t["title"] for t in closed_today], ensure_ascii=False)}
 Осталось открытых: {len(open_tasks)}
@@ -308,10 +314,9 @@ def ai_evening(open_tasks, closed_today, habits, habit_logs_today):
 — Что молодец (конкретно по закрытым)
 — Топ-3 на завтра
 — Одна ободряющая фраза в конце
-
 По-русски, тепло но без сюсюканья."""
     r = claude.messages.create(model="claude-opus-4-5", max_tokens=400,
-        messages=[{"role":"user","content":prompt}])
+                               messages=[{"role":"user","content":prompt}])
     return r.content[0].text
 
 def ai_weekly(open_tasks, closed_week, projects):
@@ -326,22 +331,21 @@ def ai_weekly(open_tasks, closed_week, projects):
 — Что буксует (задачи которые давно висят)
 — Топ-3 фокуса на следующую неделю
 — Одна стратегическая мысль
-
 По-русски, структурированно."""
     r = claude.messages.create(model="claude-opus-4-5", max_tokens=500,
-        messages=[{"role":"user","content":prompt}])
+                               messages=[{"role":"user","content":prompt}])
     return r.content[0].text
 
-# ── VOICE ─────────────────────────────────────────────────────────────────────────────────
+# ── VOICE ──────────────────────────────────────────────────────────────────────
 async def transcribe(bot, file_id):
     tg_file = await bot.get_file(file_id)
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
         await tg_file.download_to_drive(tmp.name)
         with open(tmp.name, "rb") as audio:
             result = oai.audio.transcriptions.create(model="whisper-1", file=audio, language="ru")
-            return result.text
+    return result.text
 
-# ── FORMATTERS ──────────────────────────────────────────────────────────────────────
+# ── FORMATTERS ─────────────────────────────────────────────────────────────────
 def fmt_tasks(tasks):
     if not tasks:
         return "_Задач нет ✨_"
@@ -382,7 +386,6 @@ def fmt_habits(user_id):
         return "_Привычки не настроены. Напиши: «Добавь привычку тренировка каждый день»_"
     logs_today = db_get_habit_logs_today(user_id)
     logs_week  = db_get_habit_logs_week(user_id)
-
     lines = []
     for h in habits:
         done_today = h["id"] in logs_today
@@ -396,12 +399,11 @@ def fmt_habits(user_id):
         lines.append(f"*{h['title']}* — {status}\n  Неделя: {week_str}")
     return "\n\n".join(lines)
 
-# ── PROCESS INPUT ─────────────────────────────────────────────────────────────────────
+# ── PROCESS INPUT ──────────────────────────────────────────────────────────────
 async def process_input(uid, text, update):
     existing_tasks    = db_get_open(uid)
     existing_projects = db_get_projects(uid)
     existing_habits   = db_get_habits(uid)
-
     result = ai_parse(text, existing_tasks, existing_projects, existing_habits)
 
     added_tasks = []
@@ -485,7 +487,7 @@ async def process_input(uid, text, update):
 
     await update.message.reply_text("\n\n".join(parts), parse_mode="Markdown")
 
-# ── COMMAND HANDLERS ──────────────────────────────────────────────────────────────────
+# ── COMMAND HANDLERS ───────────────────────────────────────────────────────────
 async def cmd_start(update, _ctx):
     await update.message.reply_text(
         "👋 Привет, Лена!\n\n"
@@ -549,7 +551,7 @@ async def cmd_notes(update, ctx):
         lines.append(f"\n{CAT_LABEL.get(cat,'📌 Другое')}")
         for n in items:
             date = n["created_at"][:10]
-            lines.append(f"• {n['content']}  {date}")
+            lines.append(f"• {n['content']} {date}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_habits(update, _ctx):
@@ -559,12 +561,12 @@ async def cmd_habits(update, _ctx):
 async def cmd_briefing(update, _ctx):
     uid = update.effective_user.id
     await update.message.reply_text("⏳ Анализирую...")
-    tasks    = db_get_open(uid)
-    closed   = db_get_closed_today(uid)
+    tasks   = db_get_open(uid)
+    closed  = db_get_closed_today(uid)
     projects = db_get_projects(uid)
-    habits   = db_get_habits(uid)
-    logs     = db_get_habit_logs_today(uid)
-    text     = ai_morning(tasks, closed, projects, habits, logs)
+    habits  = db_get_habits(uid)
+    logs    = db_get_habit_logs_today(uid)
+    text    = ai_morning(tasks, closed, projects, habits, logs)
     await update.message.reply_text(f"🌅 Брифинг дня\n\n{text}", parse_mode="Markdown")
 
 async def cmd_report(update, _ctx):
@@ -574,13 +576,11 @@ async def cmd_report(update, _ctx):
     closed_tasks = db_get_done(uid)
     closed_today = db_get_closed_today(uid)
     projects     = db_get_projects(uid)
-
     proj_lines = []
     for p in projects:
         stages = db_get_project_stages(p["id"])
         done = sum(1 for s in stages if s["status"] == "done")
         proj_lines.append(f"📁 {p['title']}: {done}/{len(stages)} этапов")
-
     text = (
         f"📊 Полный отчёт\n\n"
         f"Открытых задач: {len(open_tasks)}\n"
@@ -604,7 +604,7 @@ async def cmd_rate(update, ctx):
     except:
         await update.message.reply_text("Используй: /rate 4 (от 1 до 5)")
 
-# ── TEXT HANDLER ──────────────────────────────────────────────────────────────────────
+# ── TEXT HANDLER ───────────────────────────────────────────────────────────────
 async def handle_text(update, ctx):
     text = update.message.text or ""
     uid  = update.effective_user.id
@@ -658,14 +658,14 @@ async def handle_voice(update, ctx):
     await update.message.reply_text("🎤 Расшифровываю...")
     try:
         text = await transcribe(ctx.bot, update.message.voice.file_id)
-        await update.message.reply_text(f"📝 _{text}_", parse_mode="Markdown")
+        await update.message.reply_text(f"📝 {text}", parse_mode="Markdown")
         await update.message.reply_text("🤔 Разбираю...")
         await process_input(update.effective_user.id, text, update)
     except Exception as e:
         log.error(e)
         await update.message.reply_text(f"❌ Ошибка голоса: {e}")
 
-# ── SCHEDULED JOBS ──────────────────────────────────────────────────────────────────
+# ── SCHEDULED JOBS ─────────────────────────────────────────────────────────────
 async def job_morning(ctx):
     for uid in db_all_users():
         try:
@@ -756,7 +756,7 @@ async def job_waiting_check(ctx):
         except Exception as e:
             log.error(f"Waiting check {uid}: {e}")
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────────────────
+# ── MAIN ───────────────────────────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -769,6 +769,7 @@ def main():
     app.add_handler(CommandHandler("briefing", cmd_briefing))
     app.add_handler(CommandHandler("report",   cmd_report))
     app.add_handler(CommandHandler("rate",     cmd_rate))
+
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT,  handle_text))
 
