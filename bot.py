@@ -3,6 +3,7 @@ import json
 import logging
 import tempfile
 from datetime import datetime, time, timedelta
+
 import pytz
 from anthropic import Anthropic
 from openai import OpenAI
@@ -56,9 +57,12 @@ def db_get_open(user_id):
         .order("created_at").execute().data
 
 def db_get_closed_today(user_id):
+    # UAE midnight in UTC to correctly count today's closures
+    today_uae = datetime.now(UAE_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_utc = today_uae.astimezone(pytz.utc).isoformat()
     return supabase.table("tasks").select("*")\
         .eq("user_id", user_id).eq("status", "done")\
-        .gte("closed_at", today_str()).execute().data
+        .gte("closed_at", today_utc).execute().data
 
 def db_get_done(user_id):
     return supabase.table("tasks").select("*")\
@@ -84,7 +88,7 @@ def db_close_task(task_id, user_id):
     # Recreate if recurring
     if task.get("is_recurring") and task.get("recurrence"):
         db_add_task(user_id, task["title"], task["category"], task["priority"],
-                    nextdeadline(task["recurrence"]), task.get("notes"),
+                    _next_deadline(task["recurrence"]), task.get("notes"),
                     True, task["recurrence"])
 
 def db_set_waiting(task_id, user_id):
@@ -96,7 +100,7 @@ def db_all_users():
     res = supabase.table("tasks").select("user_id").execute()
     return list(set(r["user_id"] for r in res.data))
 
-def nextdeadline(recurrence: str) -> str:
+def _next_deadline(recurrence: str) -> str:
     today = now_uae().date()
     if recurrence == "daily":
         return (today + timedelta(days=1)).isoformat()
@@ -241,6 +245,7 @@ def ai_parse(text, existing_tasks, existing_projects, existing_habits):
     tasks_ctx = json.dumps([{"id":t["id"],"title":t["title"]} for t in existing_tasks], ensure_ascii=False)
     proj_ctx  = json.dumps([{"id":p["id"],"title":p["title"]} for p in existing_projects], ensure_ascii=False)
     hab_ctx   = json.dumps([{"id":h["id"],"title":h["title"]} for h in existing_habits], ensure_ascii=False)
+
     r = claude.messages.create(
         model="claude-opus-4-5", max_tokens=1500,
         system=SYSTEM_PARSE + f"\n\nОткрытые задачи: {tasks_ctx}\nПроекты: {proj_ctx}\nПривычки: {hab_ctx}",
@@ -257,10 +262,12 @@ def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
         stages = db_get_project_stages(p["id"])
         done = sum(1 for s in stages if s["status"] == "done")
         proj_summary.append(f"{p['title']}: {done}/{len(stages)} этапов")
+
     habits_status = []
     for h in habits:
         done = h["id"] in habit_logs_today
         habits_status.append(f"{'✅' if done else '⬜'} {h['title']}")
+
     prompt = f"""Утро Елены. Напиши:
 1. Персональную мотивационную фразу (1-2 предложения) — основана на её задачах сегодня, живая и конкретная, не банальная
 2. Топ-3 приоритета на день
@@ -270,7 +277,6 @@ def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
 Открытых задач: {len(open_tasks)} | Срочных: {len(urgent)} | Закрыто вчера: {len(closed_today)}
 Активные проекты: {', '.join(proj_summary) if proj_summary else 'нет'}
 Привычки: {', '.join(habits_status) if habits_status else 'не настроены'}
-
 Задачи: {json.dumps([{"title":t["title"],"priority":t["priority"],"deadline":t.get("deadline")} for t in open_tasks[:10]], ensure_ascii=False)}
 
 Формат ответа:
@@ -284,6 +290,7 @@ def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
 ⏭ Можно отложить: ...
 
 Стиль: по-русски, коротко, конкретно."""
+
     r = claude.messages.create(model="claude-opus-4-5", max_tokens=500,
                                messages=[{"role":"user","content":prompt}])
     return r.content[0].text
@@ -291,10 +298,8 @@ def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
 def ai_midday(open_tasks, closed_today):
     urgent = [t for t in open_tasks if t["priority"] == "срочно"]
     prompt = f"""Дневное напоминание Елены (13:00). Коротко, по делу.
-
 Открыто: {len(open_tasks)} | Срочных: {len(urgent)} | Закрыто сегодня: {len(closed_today)}
 Срочные: {json.dumps([t["title"] for t in urgent], ensure_ascii=False)}
-
 Напиши: что нужно закрыть до вечера, один конкретный совет. По-русски, 3-4 предложения."""
     r = claude.messages.create(model="claude-opus-4-5", max_tokens=300,
                                messages=[{"role":"user","content":prompt}])
@@ -305,17 +310,19 @@ def ai_evening(open_tasks, closed_today, habits, habit_logs_today):
     for h in habits:
         done = h["id"] in habit_logs_today
         habits_status.append(f"{'✅' if done else '❌'} {h['title']}")
+
     prompt = f"""Вечерний итог Елены (21:00).
 Закрыто сегодня: {len(closed_today)} задач: {json.dumps([t["title"] for t in closed_today], ensure_ascii=False)}
 Осталось открытых: {len(open_tasks)}
 Привычки сегодня: {', '.join(habits_status) if habits_status else 'не настроены'}
 
-Напиши:
-— Что молодец (конкретно по закрытым)
-— Топ-3 на завтра
-— Одна ободряющая фраза в конце
+Напиши КОРОТКО (максимум 5 предложений):
+— Что молодец (конкретно по закрытым, если ничего не закрыто — мотивируй)
+— Топ-3 на завтра из открытых задач
+— Одна ободряющая фраза
+
 По-русски, тепло но без сюсюканья."""
-    r = claude.messages.create(model="claude-opus-4-5", max_tokens=400,
+    r = claude.messages.create(model="claude-opus-4-5", max_tokens=300,
                                messages=[{"role":"user","content":prompt}])
     return r.content[0].text
 
@@ -331,6 +338,7 @@ def ai_weekly(open_tasks, closed_week, projects):
 — Что буксует (задачи которые давно висят)
 — Топ-3 фокуса на следующую неделю
 — Одна стратегическая мысль
+
 По-русски, структурированно."""
     r = claude.messages.create(model="claude-opus-4-5", max_tokens=500,
                                messages=[{"role":"user","content":prompt}])
@@ -358,7 +366,7 @@ def fmt_tasks(tasks):
         for t in items:
             p  = PRIO_EMOJI.get(t.get("priority","обычное"), "⚪")
             st = "⏳ " if t.get("status") == "waiting" else ""
-            dl = f" {t['deadline']}" if t.get("deadline") else ""
+            dl = f" _{t['deadline']}_" if t.get("deadline") else ""
             rc = " 🔄" if t.get("is_recurring") else ""
             lines.append(f"{p} {st}{t['title']}{dl}{rc}  /c{t['id']}")
     return "\n".join(lines)
@@ -373,10 +381,10 @@ def fmt_projects(user_id):
         done = sum(1 for s in stages if s["status"] == "done")
         total = len(stages)
         bar = "▓" * done + "░" * (total - done)
-        lines.append(f"\n📁 {p['title']} [{done}/{total}] {bar}")
+        lines.append(f"\n📁 *{p['title']}* [{done}/{total}] {bar}")
         for s in stages:
             st = "✅" if s["status"] == "done" else "▸"
-            dl = f" {s['deadline']}" if s.get("deadline") else ""
+            dl = f" _{s['deadline']}_" if s.get("deadline") else ""
             lines.append(f"  {st} {s['title']}{dl}" + ("" if s["status"]=="done" else f"  /cs{s['id']}"))
     return "\n".join(lines)
 
@@ -386,6 +394,7 @@ def fmt_habits(user_id):
         return "_Привычки не настроены. Напиши: «Добавь привычку тренировка каждый день»_"
     logs_today = db_get_habit_logs_today(user_id)
     logs_week  = db_get_habit_logs_week(user_id)
+
     lines = []
     for h in habits:
         done_today = h["id"] in logs_today
@@ -404,6 +413,7 @@ async def process_input(uid, text, update):
     existing_tasks    = db_get_open(uid)
     existing_projects = db_get_projects(uid)
     existing_habits   = db_get_habits(uid)
+
     result = ai_parse(text, existing_tasks, existing_projects, existing_habits)
 
     added_tasks = []
@@ -465,20 +475,20 @@ async def process_input(uid, text, update):
     # Build reply
     parts = []
     if added_tasks:
-        parts.append(f"✅ Задач добавлено: {len(added_tasks)}\n" +
+        parts.append(f"✅ Задач добавлено: *{len(added_tasks)}*\n" +
                      "\n".join(f"{PRIO_EMOJI.get(t['priority'],'⚪')} {t['title']}" for t in added_tasks))
     if added_projects:
-        parts.append(f"📁 Проектов создано: {len(added_projects)}\n" +
+        parts.append(f"📁 Проектов создано: *{len(added_projects)}*\n" +
                      "\n".join(f"• {p['title']}" for p in added_projects))
     if added_notes:
-        parts.append(f"📝 Записано заметок: {len(added_notes)}")
+        parts.append(f"📝 Записано заметок: *{len(added_notes)}*")
     if added_habits:
-        parts.append(f"🔄 Привычек добавлено: {len(added_habits)}\n" +
+        parts.append(f"🔄 Привычек добавлено: *{len(added_habits)}*\n" +
                      "\n".join(f"• {h['title']}" for h in added_habits))
     if closed_n:
-        parts.append(f"✅ Закрыто: {closed_n}")
+        parts.append(f"✅ Закрыто: *{closed_n}*")
     if waiting_n:
-        parts.append(f"⏳ В ожидании: {waiting_n}")
+        parts.append(f"⏳ В ожидании: *{waiting_n}*")
     if result.get("summary"):
         parts.append(f"\n_{result['summary']}_")
 
@@ -515,7 +525,7 @@ async def cmd_start(update, _ctx):
 async def cmd_tasks(update, _ctx):
     tasks = db_get_open(update.effective_user.id)
     await update.message.reply_text(
-        f"📋 Открытые задачи — {len(tasks)} шт.\n{fmt_tasks(tasks)}",
+        f"📋 *Открытые задачи* — {len(tasks)} шт.\n{fmt_tasks(tasks)}",
         parse_mode="Markdown"
     )
 
@@ -525,14 +535,14 @@ async def cmd_done(update, _ctx):
         await update.message.reply_text("Сегодня ещё ничего не закрыто 🌱")
         return
     await update.message.reply_text(
-        f"✅ Закрыто сегодня — {len(tasks)} шт.:\n\n" +
+        f"✅ *Закрыто сегодня — {len(tasks)} шт.:*\n\n" +
         "\n".join(f"✅ {t['title']}" for t in tasks),
         parse_mode="Markdown"
     )
 
 async def cmd_projects(update, _ctx):
     text = fmt_projects(update.effective_user.id)
-    await update.message.reply_text(f"📁 Проекты:\n{text}", parse_mode="Markdown")
+    await update.message.reply_text(f"📁 *Проекты:*\n{text}", parse_mode="Markdown")
 
 async def cmd_notes(update, ctx):
     uid   = update.effective_user.id
@@ -546,17 +556,17 @@ async def cmd_notes(update, ctx):
     by_cat = {}
     for n in notes[:20]:
         by_cat.setdefault(n.get("category","other"), []).append(n)
-    lines = [f"📝 Заметки{' по «'+search+'»' if search else ''} — {len(notes)} шт."]
+    lines = [f"📝 *Заметки{' по «'+search+'»' if search else ''}* — {len(notes)} шт."]
     for cat, items in by_cat.items():
         lines.append(f"\n{CAT_LABEL.get(cat,'📌 Другое')}")
         for n in items:
             date = n["created_at"][:10]
-            lines.append(f"• {n['content']} {date}")
+            lines.append(f"• {n['content']} _{date}_")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_habits(update, _ctx):
     text = fmt_habits(update.effective_user.id)
-    await update.message.reply_text(f"🔄 Привычки:\n\n{text}", parse_mode="Markdown")
+    await update.message.reply_text(f"🔄 *Привычки:*\n\n{text}", parse_mode="Markdown")
 
 async def cmd_briefing(update, _ctx):
     uid = update.effective_user.id
@@ -567,7 +577,7 @@ async def cmd_briefing(update, _ctx):
     habits  = db_get_habits(uid)
     logs    = db_get_habit_logs_today(uid)
     text    = ai_morning(tasks, closed, projects, habits, logs)
-    await update.message.reply_text(f"🌅 Брифинг дня\n\n{text}", parse_mode="Markdown")
+    await update.message.reply_text(f"🌅 *Брифинг дня*\n\n{text}", parse_mode="Markdown")
 
 async def cmd_report(update, _ctx):
     uid = update.effective_user.id
@@ -576,16 +586,18 @@ async def cmd_report(update, _ctx):
     closed_tasks = db_get_done(uid)
     closed_today = db_get_closed_today(uid)
     projects     = db_get_projects(uid)
+
     proj_lines = []
     for p in projects:
         stages = db_get_project_stages(p["id"])
         done = sum(1 for s in stages if s["status"] == "done")
         proj_lines.append(f"📁 {p['title']}: {done}/{len(stages)} этапов")
+
     text = (
-        f"📊 Полный отчёт\n\n"
-        f"Открытых задач: {len(open_tasks)}\n"
-        f"Закрыто сегодня: {len(closed_today)}\n"
-        f"Всего закрыто: {len(closed_tasks)}\n\n"
+        f"📊 *Полный отчёт*\n\n"
+        f"Открытых задач: *{len(open_tasks)}*\n"
+        f"Закрыто сегодня: *{len(closed_today)}*\n"
+        f"Всего закрыто: *{len(closed_tasks)}*\n\n"
     )
     if proj_lines:
         text += "*Проекты:*\n" + "\n".join(proj_lines) + "\n\n"
@@ -658,7 +670,7 @@ async def handle_voice(update, ctx):
     await update.message.reply_text("🎤 Расшифровываю...")
     try:
         text = await transcribe(ctx.bot, update.message.voice.file_id)
-        await update.message.reply_text(f"📝 {text}", parse_mode="Markdown")
+        await update.message.reply_text(f"📝 _{text}_", parse_mode="Markdown")
         await update.message.reply_text("🤔 Разбираю...")
         await process_input(update.effective_user.id, text, update)
     except Exception as e:
@@ -676,7 +688,7 @@ async def job_morning(ctx):
             logs     = db_get_habit_logs_today(uid)
             text     = ai_morning(tasks, closed, projects, habits, logs)
             await ctx.bot.send_message(chat_id=uid,
-                text=f"🌅 Доброе утро, Лена!\n\n{text}", parse_mode="Markdown")
+                text=f"🌅 *Доброе утро, Лена!*\n\n{text}", parse_mode="Markdown")
         except Exception as e:
             log.error(f"Morning job {uid}: {e}")
 
@@ -689,7 +701,7 @@ async def job_midday(ctx):
                 continue
             text = ai_midday(tasks, closed)
             await ctx.bot.send_message(chat_id=uid,
-                text=f"☀️ Дневное напоминание:\n\n{text}", parse_mode="Markdown")
+                text=f"☀️ *Дневное напоминание:*\n\n{text}", parse_mode="Markdown")
         except Exception as e:
             log.error(f"Midday job {uid}: {e}")
 
@@ -701,8 +713,28 @@ async def job_evening(ctx):
             habits  = db_get_habits(uid)
             logs    = db_get_habit_logs_today(uid)
             text    = ai_evening(tasks, closed, habits, logs)
-            msg     = f"🌙 Итог дня:\n\n{text}\n\nОцени день: /rate 1-5"
-            await ctx.bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
+
+            # Part 1: AI summary
+            msg1 = f"🌙 *Итог дня:*\n\n{text}\n\nОцени день: /rate 1-5"
+            await ctx.bot.send_message(chat_id=uid, text=msg1, parse_mode="Markdown")
+
+            # Part 2: open tasks list
+            if tasks:
+                task_lines = []
+                for t in tasks:
+                    p = PRIO_EMOJI.get(t.get("priority","обычное"),"⚪")
+                    dl = f" _{t['deadline']}_" if t.get("deadline") else ""
+                    task_lines.append(f"{p} {t['title']}{dl}  /c{t['id']}")
+                # Split into chunks of 20 tasks
+                chunk_size = 20
+                for i in range(0, len(task_lines), chunk_size):
+                    chunk = task_lines[i:i+chunk_size]
+                    header = f"📋 *Открытые задачи ({len(tasks)} шт.):*" if i == 0 else f"📋 *...продолжение:*"
+                    await ctx.bot.send_message(
+                        chat_id=uid,
+                        text=f"{header}\n\n" + "\n".join(chunk),
+                        parse_mode="Markdown"
+                    )
         except Exception as e:
             log.error(f"Evening job {uid}: {e}")
 
@@ -716,7 +748,7 @@ async def job_weekly(ctx):
             projects     = db_get_projects(uid)
             text         = ai_weekly(open_tasks, closed_week, projects)
             await ctx.bot.send_message(chat_id=uid,
-                text=f"📊 Недельный обзор:\n\n{text}", parse_mode="Markdown")
+                text=f"📊 *Недельный обзор:*\n\n{text}", parse_mode="Markdown")
         except Exception as e:
             log.error(f"Weekly job {uid}: {e}")
 
@@ -732,11 +764,11 @@ async def job_deadline_check(ctx):
             if due_today:
                 lines = "\n".join(f"🔴 {t['title']}" for t in due_today)
                 await ctx.bot.send_message(chat_id=uid,
-                    text=f"⚠️ Дедлайн СЕГОДНЯ:\n{lines}", parse_mode="Markdown")
+                    text=f"⚠️ *Дедлайн СЕГОДНЯ:*\n{lines}", parse_mode="Markdown")
             if due_tomorrow:
                 lines = "\n".join(f"🟡 {t['title']}" for t in due_tomorrow)
                 await ctx.bot.send_message(chat_id=uid,
-                    text=f"📅 Дедлайн ЗАВТРА:\n{lines}", parse_mode="Markdown")
+                    text=f"📅 *Дедлайн ЗАВТРА:*\n{lines}", parse_mode="Markdown")
         except Exception as e:
             log.error(f"Deadline check {uid}: {e}")
 
@@ -751,7 +783,7 @@ async def job_waiting_check(ctx):
             if res.data:
                 lines = "\n".join(f"⏳ {t['title']}" for t in res.data)
                 await ctx.bot.send_message(chat_id=uid,
-                    text=f"🔔 Жду ответа — прошло 2+ дня:\n{lines}\n\nПолучила ответ? Закрой /cXXX или продолжи ждать.",
+                    text=f"🔔 *Жду ответа — прошло 2+ дня:*\n{lines}\n\nПолучила ответ? Закрой /cXXX или продолжи ждать.",
                     parse_mode="Markdown")
         except Exception as e:
             log.error(f"Waiting check {uid}: {e}")
@@ -769,7 +801,6 @@ def main():
     app.add_handler(CommandHandler("briefing", cmd_briefing))
     app.add_handler(CommandHandler("report",   cmd_report))
     app.add_handler(CommandHandler("rate",     cmd_rate))
-
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT,  handle_text))
 
