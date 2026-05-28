@@ -202,6 +202,73 @@ def db_save_rating(user_id, rating, note=None):
         pass
 
 # ── AI: PARSE ──────────────────────────────────────────────────────────────────
+ELENA_PROFILE = """
+Ты — персональный AI-ассистент Елены Дятловой. Знаешь её хорошо.
+
+КТО ТАКАЯ ЕЛЕНА:
+- 34 года, живёт в Аль-Айне, ОАЭ (эмират Абу-Даби), с партнёром Лёшей
+- В прошлом управляла ресторанами — сильное системное мышление, понимает бизнес изнутри
+- Переехала в ОАЭ ради отношений и нового старта
+
+БИЗНЕС — Cozy Home (Crystal World Cleaning Services L.L.C.):
+- Чистка и обслуживание кондиционеров в Аль-Айне и Дубае
+- Партнёр и со-владелец — Лёша
+- Цель: захватить рынок арабских вилл Аль-Айна
+- Instagram: англоязычный, сайт на трёх языках (русский/английский/арабский)
+- Елена — создатель системы, не лицо бренда Cozy Home
+
+AI-НАПРАВЛЕНИЕ (личный бренд):
+- AI-креатор для брендов и инфлюенсеров: визуал, ролики, сайты, CRM, автоматизация
+- Делала: ролики для ресторанов/HoReCa, ребрендинг, упаковку, сайт Cozy Home, CRM для Cozy Home
+- Суперсила: связка идея → визуал → контент → сайт → CRM → автоматизация
+- Нейросети — инструмент который делает бизнес дороже и жизнь проще
+
+БЛОГ И ЛИЧНЫЙ БРЕНД:
+- Instagram + Telegram, личный (не Cozy Home)
+- Темы: жизнь в эмиграции в ОАЭ, AI в реальном бизнесе, путь предпринимателя, Cozy Home за кулисами
+- Показывать личное (Лёша, быт) — да, но без перебора
+- Позиционирование: "AI-креатор и предприниматель в ОАЭ"
+- Черновик шапки: "Живу в ОАЭ и строю бизнес на жаре. Через нейросети помогаю брендам упаковывать себя: визуал, ролики, сайты и системы."
+
+ПОРТФОЛИО-САЙТ "Я и Creator":
+Разделы: Главная / Обо мне / Услуги AI / Кейсы / Cozy Home / Контакты
+Ролики для портфолио которые нужно сделать:
+1. "Кто я и чем полезна"
+2. "AI для бренда/инфлюенсера"  
+3. "Cozy Home — реальный бизнес в ОАЭ"
+4. Кейс (до/после)
+5. "Как AI помогает мне каждый день"
+
+ПЛАН КОНТЕНТА COZY HOME (3 выхода в неделю):
+- 1 пост "польза": здоровье, дети, пыль, плесень, жара в ОАЭ
+- 1 пост "бэкстейдж": выезд, процесс, до/после
+- 1 пост "социальное доказательство": отзывы, кейсы
+
+ПЛАН ЛИЧНОГО БЛОГА (15-30 мин в день по циклу):
+День 1 — сценарий ролика
+День 2 — съёмка
+День 3 — кейс
+День 4 — монтаж
+День 5 — упаковка услуг
+
+ФИТНЕС (важно!):
+- Колено — бурсит в прошлом. БЕЗ приседаний и выпадов
+- Цель: похудение + тонус
+- 4-5 активных дней в неделю (зал + бег/ходьба)
+- Белок в каждый приём пищи, вода весь день
+- Еженедельно: взвеситься + фото + отметить энергию/сон
+
+ЦЕННОСТИ: свобода, польза людям, деньги, творчество, отношения
+ЭСТЕТИКА: кинематографично, стильно — SWBAND.CO, "стильно, красиво и правильно"
+
+КАК ОБЩАТЬСЯ:
+- Тепло, по-партнёрски, конкретно — без сюсюканья и воды
+- Когда говорит потоком — структурируй сама, не жди уточнений
+- Если задача размытая — предложи разбивку на шаги сама
+- Длинные голосовые — читай по смыслу даже если расшифровка "плавает"
+- Знаешь её контекст — не заставляй объяснять заново
+"""
+
 SYSTEM_PARSE = """Ты — AI-планировщик предпринимателя Елены (Al Ain, UAE).
 
 Категории:
@@ -247,12 +314,25 @@ def ai_parse(text, existing_tasks, existing_projects, existing_habits):
     hab_ctx   = json.dumps([{"id":h["id"],"title":h["title"]} for h in existing_habits], ensure_ascii=False)
 
     r = claude.messages.create(
-        model="claude-opus-4-5", max_tokens=1500,
+        model="claude-opus-4-5", max_tokens=2500,
         system=SYSTEM_PARSE + f"\n\nОткрытые задачи: {tasks_ctx}\nПроекты: {proj_ctx}\nПривычки: {hab_ctx}",
         messages=[{"role":"user","content":text}]
     )
     raw = r.content[0].text.replace("```json","").replace("```","").strip()
-    return json.loads(raw)
+    # Try to extract JSON if there's extra text
+    if not raw.startswith("{"):
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start != -1 and end > start:
+            raw = raw[start:end]
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Fallback: return empty result with error summary
+        return {"new_tasks": [], "new_projects": [], "new_notes": [],
+                "new_habits": [], "close_task_ids": [], "close_stage_ids": [],
+                "habit_done": [], "waiting_ids": [],
+                "summary": "Сообщение слишком длинное — попробуй разбить на части"}
 
 # ── AI: BRIEFING ───────────────────────────────────────────────────────────────
 def ai_morning(open_tasks, closed_today, projects, habits, habit_logs_today):
@@ -658,7 +738,25 @@ async def handle_text(update, ctx):
             await update.message.reply_text(f"Не удалось: {e}")
         return
 
-    # Process as AI input
+    # Detect think mode
+    think_triggers = ["давай подумаем", "помоги разобраться", "хочу обсудить",
+                      "как думаешь", "что думаешь", "помоги понять", "подумаем",
+                      "давай обсудим", "как лучше", "посоветуй", "я вернулась",
+                      "подобьёмся", "подобьемся", "давай с тобой", "мой дорогой"]
+    is_think_mode = any(trigger in text.lower() for trigger in think_triggers)
+
+    if is_think_mode:
+        await update.message.reply_text("💭 Думаю...")
+        try:
+            tasks = db_get_open(uid)
+            response = ai_think(text, tasks)
+            await update.message.reply_text(response)
+        except Exception as e:
+            log.error(e)
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    # Process as tasks input
     await update.message.reply_text("🤔 Разбираю...")
     try:
         await process_input(uid, text, update)
@@ -671,13 +769,46 @@ async def handle_voice(update, ctx):
     try:
         text = await transcribe(ctx.bot, update.message.voice.file_id)
         await update.message.reply_text(f"📝 _{text}_", parse_mode="Markdown")
-        await update.message.reply_text("🤔 Разбираю...")
-        await process_input(update.effective_user.id, text, update)
+        think_triggers = ["давай подумаем", "помоги разобраться", "хочу обсудить",
+                          "как думаешь", "что думаешь", "помоги понять", "подумаем",
+                          "давай обсудим", "как лучше", "посоветуй", "я вернулась",
+                          "подобьёмся", "подобьемся", "давай с тобой"]
+        is_think_mode = any(trigger in text.lower() for trigger in think_triggers)
+        
+        if is_think_mode:
+            await update.message.reply_text("💭 Думаю...")
+            tasks = db_get_open(update.effective_user.id)
+            response = ai_think(text, tasks)
+            await update.message.reply_text(response)
+        else:
+            await update.message.reply_text("🤔 Разбираю...")
+            await process_input(update.effective_user.id, text, update)
     except Exception as e:
         log.error(e)
         await update.message.reply_text(f"❌ Ошибка голоса: {e}")
 
 # ── SCHEDULED JOBS ─────────────────────────────────────────────────────────────
+
+def ai_think(text, context_tasks):
+    """Режим 'думать вместе' — стратег/собеседник"""
+    open_count = len(context_tasks)
+    r = claude.messages.create(
+        model="claude-opus-4-5", max_tokens=1000,
+        system=ELENA_PROFILE + """
+Сейчас Елена хочет подумать вместе, а не добавить задачи.
+
+Веди себя как умный партнёр-стратег:
+- Структурируй её поток мыслей
+- Выдели главное и второстепенное  
+- Задай 1-2 уточняющих вопроса если нужно
+- Предложи конкретный следующий шаг
+- Если в потоке есть готовые задачи — выдели их в конце отдельным блоком "Задачи к добавлению:"
+
+НЕ пиши JSON. Отвечай живым текстом, по-русски, тепло но конкретно.""",
+        messages=[{"role": "user", "content": text}]
+    )
+    return r.content[0].text
+
 async def job_morning(ctx):
     for uid in db_all_users():
         try:
